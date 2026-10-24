@@ -38,7 +38,21 @@ torse-server <dir> --listen 127.0.0.1:7801 --fill --editors
 
 需要可用的图形后端。本机实测走Vulkan，集显即可。CI不执行渲染，只做编译检查。
 
-## 组成
+## UI
+
+窗口默认绘制素材化HUD：准星、三格快捷栏、当前方块与连接状态。1到3切换方块，Esc打开或关闭菜单，E打开明确标注示例数据的机器面板预览；菜单提供返回、预览和退出。面板打开时清空移动、拖动和编辑输入，网络接收继续运行。本地行走暂不推进，联网世界不因菜单暂停。关闭窗口仍可直接退出，F12在面板中也可截图。
+
+```sh
+cargo run -p torse-client -- --window
+cargo run -p torse-client -- --window --ui-preview machine
+cargo run -p torse-client -- --capture ui.png --width 960 --height 540 --ui-preview machine
+```
+
+`--ui-preview`接受hud、pause和machine，两种渲染路径共用UI管线。界面按窗口空间自动选择1到4倍整数缩放，最小窗口640x360；PNG在编译时嵌入，窗口和按钮采用九宫格拉伸。中文与英文文案位于games/base/assets/locales，字体从操作系统读取，不随程序打包；可用TORSE_UI_FONT指定TTF、OTF或TTC。自动字体搜索依次覆盖Windows中文字体、Linux的Noto CJK、macOS中文字体和Linux的DejaVu；缺少中文字形时使用英文资源，未找到可用字体则返回明确错误。
+
+机器面板本轮只验证布局与素材，不读写真实机器或库存，不声明B10完成。授权UI状态、动作绑定、断线重建与双客户端机器验收继续后续接入。截图及验证见[UI基础](../../benchmarks/M1-ui.md)。
+
+## 代码组成
 
 | 文件 | 职责 |
 |---|---|
@@ -49,6 +63,7 @@ torse-server <dir> --listen 127.0.0.1:7801 --fill --editors
 | [input.rs](src/input.rs) | 按键、鼠标与滚轮的帧级聚合，区分点击与拖动 |
 | [pick.rs](src/pick.rs) | 体素DDA拾取射线，返回目标格与进入面 |
 | [main.rs](src/main.rs) | 参数解析与两种模式的入口 |
+| [ui](src/ui/mod.rs) | 素材、文字、HUD、模态输入与机器面板预览 |
 
 顶点为位置、法线、颜色各三浮点，共36字节，按材质映射到一个扁平颜色，光照由法线与固定方向光决定。窗口surface格式由适配器决定（本机为BGRA），管线颜色目标按实际格式创建，截图读回时转换成RGBA。
 

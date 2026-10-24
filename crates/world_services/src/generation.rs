@@ -182,9 +182,18 @@ fn fill_section(
 ) -> Result<Section, SectionError> {
     let mut result = Section::new(params.side, params.air)?;
     let side = params.side;
-    let base_x = section.x * i64::from(side);
-    let base_y = section.y * i64::from(side);
-    let base_z = section.z * i64::from(side);
+    let origin = section.to_block(torse_types::LocalPos { x: 0, y: 0, z: 0 }, side)?;
+    // Validate both ends before visiting cells. This protects the additions
+    // below as well as the section-to-block multiplications.
+    section.to_block(
+        torse_types::LocalPos {
+            x: side - 1,
+            y: side - 1,
+            z: side - 1,
+        },
+        side,
+    )?;
+    let (base_x, base_y, base_z) = (origin.x, origin.y, origin.z);
 
     for local_y in 0..side {
         let world_y = base_y + i64::from(local_y);
@@ -379,5 +388,32 @@ mod tests {
             0,
             "outside the world it writes nothing"
         );
+    }
+    #[test]
+    fn unrepresentable_section_coordinates_are_rejected_without_panicking() {
+        let flat = FlatTerrain::new(params(), 8);
+        let hills = HillTerrain::new(params(), 7, 7, 9);
+        for section in [
+            SectionPos::new(i64::MAX, 0, 0),
+            SectionPos::new(i64::MIN, 0, 0),
+            SectionPos::new(0, i64::MAX, 0),
+            SectionPos::new(0, 0, i64::MIN),
+        ] {
+            assert!(flat.generate(section).is_err());
+            assert!(hills.generate(section).is_err());
+        }
+    }
+
+    #[test]
+    fn representable_sections_at_coordinate_limits_still_generate() {
+        let generator = HillTerrain::new(params(), 7, 7, 9);
+        for x in [i64::MIN / 16, i64::MAX / 16] {
+            for z in [i64::MIN / 16, i64::MAX / 16] {
+                assert_eq!(
+                    generator.generate(SectionPos::new(x, 0, z)).unwrap().side(),
+                    16
+                );
+            }
+        }
     }
 }

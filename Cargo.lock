@@ -2732,6 +2732,7 @@ version = "0.1.0"
 name = "torse-client"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "png",
  "pollster",
  "torse-codec",

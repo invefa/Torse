@@ -463,7 +463,18 @@ impl Scene {
         let mut wanted = Vec::new();
         for x in -self.radius..=self.radius {
             for z in -self.radius..=self.radius {
-                wanted.push(SectionPos::new(center.x + x, 0, center.z + z));
+                let sx = center
+                    .x
+                    .checked_add(x)
+                    .ok_or("streaming coordinate overflow")?;
+                let sz = center
+                    .z
+                    .checked_add(z)
+                    .ok_or("streaming coordinate overflow")?;
+                let pos = SectionPos::new(sx, 0, sz);
+                pos.to_block(LocalPos { x: 0, y: 0, z: 0 }, self.side)
+                    .map_err(|error| error.to_string())?;
+                wanted.push(pos);
             }
         }
 
@@ -805,6 +816,51 @@ mod tests {
         assert_eq!(scene.sections().len(), 9);
         assert_eq!(scene.mesh_count(), 9);
         assert_eq!(scene.geometry().0.len(), before.0.len());
+    }
+
+    #[test]
+    fn scrolling_once_then_flying_keeps_streaming_bounded() {
+        let mut scene = Scene::new(0).unwrap();
+        let mut camera = crate::camera::FlyCamera::new(scene.eye());
+        let mut input = crate::input::InputState::new();
+        input.key(
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyW),
+            winit::event::ElementState::Pressed,
+        );
+        input.wheel(winit::event::MouseScrollDelta::LineDelta(0.0, 1.0));
+        let mut center = scene.center_section(camera.eye);
+        let mut streamed = 0;
+        for _ in 0..3600 {
+            let (motion, speed) = input.take_input(camera.speed);
+            camera.speed = speed;
+            camera.advance(motion, 1.0 / 60.0);
+            assert_eq!(camera.speed, 15.0);
+            assert!(camera.eye.iter().all(|v| v.is_finite()));
+            let next = scene.center_section(camera.eye);
+            if next != center {
+                scene.load_around(next).unwrap();
+                center = next;
+                streamed += 1;
+                assert_eq!(scene.sections().len(), 1);
+            }
+        }
+        assert!(
+            streamed > 40,
+            "exercise repeated section loading after the wheel event"
+        );
+    }
+
+    #[test]
+    fn streaming_rejects_overflow_before_changing_the_scene() {
+        let mut scene = Scene::new(1).unwrap();
+        let before = scene.sections().to_vec();
+        for center in [
+            SectionPos::new(i64::MAX, 0, 0),
+            SectionPos::new(0, 0, i64::MIN),
+        ] {
+            assert!(scene.load_around(center).is_err());
+            assert_eq!(scene.sections(), before);
+        }
     }
 
     #[test]

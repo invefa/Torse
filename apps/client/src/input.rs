@@ -74,7 +74,7 @@ impl InputState {
                 self.drag_distance = 0.0;
             }
             ElementState::Released => {
-                if self.drag_distance < CLICK_SLOP {
+                if self.dragging && self.drag_distance < CLICK_SLOP {
                     self.pending_click = Some(button);
                 }
                 self.dragging = false;
@@ -96,14 +96,16 @@ impl InputState {
         }
     }
 
-    /// Adjust the speed factor by scroll steps, clamped to the speed range.
+    /// Accumulate a bounded multiplier to consume once on the next frame.
     pub fn wheel(&mut self, delta: MouseScrollDelta) {
         let steps = match delta {
             MouseScrollDelta::LineDelta(_, lines) => lines,
             MouseScrollDelta::PixelDelta(position) => position.y as f32 / 48.0,
         };
-        self.speed_factor =
-            (self.speed_factor * SPEED_STEP.powf(steps)).clamp(SPEED_RANGE.0, SPEED_RANGE.1);
+        if steps.is_finite() {
+            self.speed_factor = (self.speed_factor * SPEED_STEP.powf(steps.clamp(-64.0, 64.0)))
+                .clamp(0.0001, 10_000.0);
+        }
     }
 
     /// Consume one frame of movement intent and the pending look delta.
@@ -124,7 +126,9 @@ impl InputState {
             yaw_delta,
             pitch_delta,
         };
-        (input, base_speed * self.speed_factor)
+        let speed = (base_speed * self.speed_factor).clamp(SPEED_RANGE.0, SPEED_RANGE.1);
+        self.speed_factor = 1.0;
+        (input, speed)
     }
 
     /// Whether the jump key is currently held.
@@ -141,11 +145,49 @@ impl InputState {
     pub fn take_screenshot(&mut self) -> bool {
         std::mem::take(&mut self.screenshot)
     }
+    /// Drop all held input when focus moves into a modal or leaves the window.
+    pub fn reset(&mut self) {
+        self.held.clear();
+        self.look_delta = PhysicalPosition::new(0.0, 0.0);
+        self.dragging = false;
+        self.last_cursor = None;
+        self.pending_click = None;
+        self.drag_distance = 0.0;
+        self.speed_factor = 1.0;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn focus_reset_cancels_held_movement_and_late_mouse_release() {
+        let mut state = InputState::new();
+        state.key(PhysicalKey::Code(KeyCode::KeyW), ElementState::Pressed);
+        state.mouse(MouseButton::Left, ElementState::Pressed);
+        state.reset();
+        state.mouse(MouseButton::Left, ElementState::Released);
+        assert!(state.take_click().is_none());
+        let (motion, _) = state.take_input(12.0);
+        assert_eq!(motion.forward, 0.0);
+        assert_eq!(motion.yaw_delta, 0.0);
+    }
+    #[test]
+    fn one_scroll_changes_speed_once_across_successive_frames() {
+        let mut state = InputState::new();
+        state.wheel(MouseScrollDelta::LineDelta(0.0, 1.0));
+        let (_, mut speed) = state.take_input(12.0);
+        assert_eq!(speed, 15.0);
+        for _ in 0..600 {
+            speed = state.take_input(speed).1;
+            assert_eq!(
+                speed, 15.0,
+                "an idle wheel must not accelerate the next frame"
+            );
+        }
+        state.wheel(MouseScrollDelta::LineDelta(0.0, -1.0));
+        assert_eq!(state.take_input(speed).1, 12.0);
+    }
 
     fn press(state: &mut InputState, code: KeyCode) {
         state.key(PhysicalKey::Code(code), ElementState::Pressed);
@@ -226,10 +268,11 @@ mod tests {
             state.wheel(MouseScrollDelta::LineDelta(0.0, -1.0));
         }
         let (_, speed) = state.take_input(12.0);
-        assert!(
-            (speed - 12.0 * SPEED_RANGE.0).abs() < 1e-4 || speed >= SPEED_RANGE.0 * 12.0 * 0.99
-        );
-        assert!(speed < SPEED_RANGE.1 * 12.0);
+        assert_eq!(speed, SPEED_RANGE.0);
+        state.wheel(MouseScrollDelta::LineDelta(0.0, 1000.0));
+        let (_, speed) = state.take_input(speed);
+        assert_eq!(speed, SPEED_RANGE.1);
+        assert_eq!(state.take_input(speed).1, SPEED_RANGE.1);
     }
 
     #[test]

@@ -416,6 +416,32 @@ impl Renderer {
         self.context.queue.submit([encoder.finish()]);
     }
 
+    /// Draw the same UI used by the window into an offscreen capture.
+    pub fn render_ui(&self, mode: crate::ui::Mode) -> Result<(), String> {
+        let (device, queue) = self.context.parts();
+        let mut layer = crate::ui::Layer::new(device, TextureFormat::Rgba8UnormSrgb)?;
+        let mut state = crate::ui::State::default();
+        state.set_mode(mode);
+        layer.prepare(
+            device,
+            queue,
+            [self.width, self.height],
+            &state,
+            crate::ui::Hud {
+                material: 0,
+                network: false,
+                ready: true,
+                result: "",
+            },
+        );
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("UI capture"),
+        });
+        layer.draw(&mut encoder, &self.color_view);
+        queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
     /// Copy the rendered frame into a PNG file.
     pub fn save_png(&self, path: &str) -> Result<(), String> {
         let padded_row = align_256(self.width * 4);

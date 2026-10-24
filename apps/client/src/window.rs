@@ -58,6 +58,8 @@ pub struct WindowConfig {
     /// Send one edit request far outside the approved scope, for acceptance
     /// evidence that the server rejects out-of-scope targets.
     pub probe_outside: bool,
+    /// Initial UI screen; machine mode is explicitly a sample-data preview.
+    pub ui_mode: crate::ui::Mode,
 }
 
 /// Measurements reported when the window closes.
@@ -109,6 +111,7 @@ pub struct WindowSummary {
 }
 
 struct Gpu {
+    ui: crate::ui::Layer,
     context: GpuContext,
     surface: Surface<'static>,
     config: SurfaceConfiguration,
@@ -119,6 +122,7 @@ struct Gpu {
 }
 
 struct WindowApp {
+    ui: crate::ui::State,
     config: WindowConfig,
     scene: Option<Scene>,
     camera: Option<FlyCamera>,
@@ -165,6 +169,11 @@ impl WindowApp {
             .map(|name| ContentKey::parse(name).expect("static material key"))
             .collect();
         Self {
+            ui: {
+                let mut state = crate::ui::State::default();
+                state.set_mode(config.ui_mode);
+                state
+            },
             config,
             scene: None,
             camera: None,
@@ -252,6 +261,19 @@ impl WindowApp {
                             });
                         gpu.context
                             .encode_draw(&mut encoder, &view, &gpu.depth_view);
+                        gpu.ui.prepare(
+                            device,
+                            queue,
+                            [gpu.config.width, gpu.config.height],
+                            &self.ui,
+                            crate::ui::Hud {
+                                material: self.material,
+                                network: self.net.is_some(),
+                                ready: false,
+                                result: &self.last_result,
+                            },
+                        );
+                        gpu.ui.draw(&mut encoder, &view);
                         queue.submit([encoder.finish()]);
                         queue.present(frame);
                     }
@@ -263,10 +285,12 @@ impl WindowApp {
         }
         let (mut motion, speed) = self.input.take_input(camera.speed);
         camera.speed = speed;
-        if self.config.autoplay {
+        if self.config.autoplay && !self.ui.modal() {
             motion.forward = 1.0;
         }
-        if self.walk {
+        if self.ui.modal() {
+            self.tick_accumulator = 0.0;
+        } else if self.walk {
             // Walk mode: look still follows the drag, but the position comes
             // from the authoritative walker entity driven at a fixed tick.
             camera.look(motion.yaw_delta, motion.pitch_delta);
@@ -389,7 +413,11 @@ impl WindowApp {
                 Err(error) => self.last_result = format!("probe failed: {error}"),
             }
         }
-        if network && self.config.autoplay && self.frames.is_multiple_of(AUTOPLAY_PERIOD) {
+        if network
+            && self.config.autoplay
+            && !self.ui.modal()
+            && self.frames.is_multiple_of(AUTOPLAY_PERIOD)
+        {
             // Over a connection the demo exercises the request path: the
             // guest session should see its edit rejected by admission.
             let aim = {
@@ -411,6 +439,7 @@ impl WindowApp {
         }
         if intent.is_none()
             && self.config.autoplay
+            && !self.ui.modal()
             && !self.walk
             && !network
             && self.frames.is_multiple_of(AUTOPLAY_PERIOD)
@@ -518,7 +547,7 @@ impl WindowApp {
             None => return,
         };
 
-        let Some(gpu) = self.gpu.as_ref() else {
+        let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
@@ -535,6 +564,19 @@ impl WindowApp {
         });
         gpu.context
             .encode_draw(&mut encoder, &view, &gpu.depth_view);
+        gpu.ui.prepare(
+            device,
+            queue,
+            [gpu.config.width, gpu.config.height],
+            &self.ui,
+            crate::ui::Hud {
+                material: self.material,
+                network: self.net.is_some(),
+                ready: self.scene.is_some(),
+                result: &self.last_result,
+            },
+        );
+        gpu.ui.draw(&mut encoder, &view);
         queue.submit([encoder.finish()]);
         if let Some(path) = self.pending_shot.take() {
             // The copy must be queued after the draw pass, otherwise it reads
@@ -739,6 +781,7 @@ impl ApplicationHandler for WindowApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes()
             .with_title("Torse client")
+            .with_min_inner_size(LogicalSize::new(640, 360))
             .with_inner_size(LogicalSize::new(self.config.width, self.config.height));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
@@ -853,7 +896,19 @@ impl ApplicationHandler for WindowApp {
             self.net = Some(connection);
         }
         self.adapter = info.name;
+        let ui = {
+            let (device, _) = context.parts();
+            match crate::ui::Layer::new(device, config.format) {
+                Ok(ui) => ui,
+                Err(error) => {
+                    self.failure = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            }
+        };
         self.gpu = Some(Gpu {
+            ui,
             backend_name: format!("{:?}", info.backend),
             context,
             surface,
@@ -907,10 +962,31 @@ impl ApplicationHandler for WindowApp {
                     && let winit::keyboard::PhysicalKey::Code(code) = event.physical_key
                 {
                     match code {
-                        KeyCode::Escape => {
-                            self.finish(event_loop);
+                        KeyCode::Escape if !event.repeat => {
+                            let mode = if self.ui.modal() {
+                                crate::ui::Mode::Game
+                            } else {
+                                crate::ui::Mode::Pause
+                            };
+                            self.ui.set_mode(mode);
+                            self.input.reset();
                             return;
                         }
+                        KeyCode::KeyE if !event.repeat => {
+                            let mode = if self.ui.modal() {
+                                crate::ui::Mode::Game
+                            } else {
+                                crate::ui::Mode::MachinePreview
+                            };
+                            self.ui.set_mode(mode);
+                            self.input.reset();
+                            return;
+                        }
+                        KeyCode::F12 => {
+                            self.input.key(event.physical_key, event.state);
+                            return;
+                        }
+                        _ if self.ui.modal() => return,
                         KeyCode::Digit1 => self.material = 0,
                         KeyCode::Digit2 => self.material = 1,
                         KeyCode::Digit3 => self.material = 2,
@@ -918,16 +994,49 @@ impl ApplicationHandler for WindowApp {
                         _ => {}
                     }
                 }
-                self.input.key(event.physical_key, event.state);
+                if !self.ui.modal() {
+                    self.input.key(event.physical_key, event.state);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                self.input.mouse(button, state);
+                if self.ui.modal() {
+                    if button == MouseButton::Left {
+                        let size = self
+                            .gpu
+                            .as_ref()
+                            .map_or([960, 540], |g| [g.config.width, g.config.height]);
+                        if let Some(action) = self.ui.pointer(state == ElementState::Pressed, size)
+                        {
+                            match action {
+                                crate::ui::Action::Quit => self.finish(event_loop),
+                                crate::ui::Action::Resume => {
+                                    self.ui.set_mode(crate::ui::Mode::Game)
+                                }
+                                crate::ui::Action::Preview => {
+                                    self.ui.set_mode(crate::ui::Mode::MachinePreview)
+                                }
+                            }
+                            self.input.reset();
+                        }
+                    }
+                } else {
+                    self.input.mouse(button, state);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.input.cursor(position);
+                self.ui.cursor = [position.x, position.y];
+                if !self.ui.modal() {
+                    self.input.cursor(position);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.input.wheel(delta);
+                if !self.ui.modal() {
+                    self.input.wheel(delta);
+                }
+            }
+            WindowEvent::Focused(false) => {
+                self.input.reset();
+                self.ui.set_mode(self.ui.mode);
             }
             WindowEvent::RedrawRequested => {
                 if self.gpu.is_some() && self.camera.is_some() {

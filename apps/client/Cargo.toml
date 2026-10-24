@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+ab_glyph = "=0.2.32"
 pollster = "0.4.0"
 png = "0.17"
 torse-content = { path = "../../crates/content" }

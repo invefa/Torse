@@ -11,6 +11,7 @@ mod net;
 mod pick;
 mod renderer;
 mod scene;
+mod ui;
 mod window;
 
 use std::process::ExitCode;
@@ -23,7 +24,7 @@ use window::{WindowConfig, run_window};
 
 const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
-                        [--screenshot <png>] [--autoplay]";
+                        [--screenshot <png>] [--autoplay] [--ui-preview hud|pause|machine]";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
     let mut walk = false;
     let mut connect: Option<String> = None;
     let mut probe_outside = false;
+    let mut ui_preview = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -77,6 +79,13 @@ fn main() -> ExitCode {
             "--walk" => walk = true,
             "--connect" => connect = value(),
             "--probe-outside" => probe_outside = true,
+            "--ui-preview" => match value().as_deref().map(ui::Mode::parse) {
+                Some(Ok(mode)) => ui_preview = Some(mode),
+                _ => {
+                    eprintln!("--ui-preview requires hud, pause or machine");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -100,6 +109,7 @@ fn main() -> ExitCode {
             walk,
             connect,
             probe_outside,
+            ui_mode: ui_preview.unwrap_or_default(),
         };
         match run_window(config) {
             Ok(summary) => {
@@ -141,7 +151,7 @@ fn main() -> ExitCode {
             }
         }
     } else if let Some(path) = capture {
-        match run(&path, width, height, radius, &view) {
+        match run(&path, width, height, radius, &view, ui_preview) {
             Ok(summary) => {
                 println!("{summary}");
                 ExitCode::SUCCESS
@@ -157,7 +167,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(path: &str, width: u32, height: u32, radius: i64, view: &str) -> Result<String, String> {
+fn run(
+    path: &str,
+    width: u32,
+    height: u32,
+    radius: i64,
+    view: &str,
+    ui_preview: Option<ui::Mode>,
+) -> Result<String, String> {
     let start = Instant::now();
     let mut scene = Scene::new(radius)?;
     scene.refresh_meshes();
@@ -179,6 +196,9 @@ fn run(path: &str, width: u32, height: u32, radius: i64, view: &str) -> Result<S
     };
     let camera = Camera::new(eye, target);
     renderer.render(camera.view_projection(width as f32 / height as f32));
+    if let Some(mode) = ui_preview {
+        renderer.render_ui(mode)?;
+    }
     renderer.save_png(path)?;
 
     let elapsed = start.elapsed();
