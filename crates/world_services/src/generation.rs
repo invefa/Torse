@@ -195,16 +195,26 @@ fn fill_section(
     )?;
     let (base_x, base_y, base_z) = (origin.x, origin.y, origin.z);
 
+    // Column heights are constant down the section, so evaluate the height
+    // function once per (x, z) column instead of once per cell; the noise
+    // path is the dominant generation cost otherwise.
+    let mut heights = vec![0i64; (side as usize) * (side as usize)];
+    for local_z in 0..side {
+        let world_z = base_z + i64::from(local_z);
+        for local_x in 0..side {
+            let world_x = base_x + i64::from(local_x);
+            heights[(local_z as usize) * (side as usize) + local_x as usize] =
+                height_at(world_x, world_z);
+        }
+    }
     for local_y in 0..side {
         let world_y = base_y + i64::from(local_y);
         if !params.bounds.contains_y(world_y) {
             continue;
         }
         for local_z in 0..side {
-            let world_z = base_z + i64::from(local_z);
             for local_x in 0..side {
-                let world_x = base_x + i64::from(local_x);
-                if world_y < height_at(world_x, world_z) {
+                if world_y < heights[(local_z as usize) * (side as usize) + local_x as usize] {
                     result.set(
                         torse_types::LocalPos {
                             x: local_x,

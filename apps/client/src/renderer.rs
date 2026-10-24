@@ -5,6 +5,7 @@
 //! texture so a frame can be captured without a window, and the windowed app
 //! draws into a surface view. The pass is identical, only the target differs.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 
 use wgpu::{
@@ -79,11 +80,18 @@ pub struct GpuContext {
     bind_group: BindGroup,
     #[allow(dead_code)]
     layout: BindGroupLayout,
-    vertex_buffer: Option<Buffer>,
-    index_buffer: Option<Buffer>,
-    index_count: u32,
+    /// One vertex/index buffer pair per resident section; edits rewrite only
+    /// the changed sections instead of re-uploading the whole scene.
+    terrain: BTreeMap<torse_types::SectionPos, SectionBuffers>,
     line_buffer: Buffer,
     line_count: u32,
+}
+
+/// GPU buffers for one section's mesh.
+struct SectionBuffers {
+    vertices: Buffer,
+    indices: Buffer,
+    index_count: u32,
 }
 
 impl GpuContext {
@@ -238,9 +246,7 @@ impl GpuContext {
             uniform,
             bind_group,
             layout,
-            vertex_buffer: None,
-            index_buffer: None,
-            index_count: 0,
+            terrain: BTreeMap::new(),
             line_buffer,
             line_count: 0,
         }
@@ -251,26 +257,37 @@ impl GpuContext {
         (&self.device, &self.queue)
     }
 
-    /// Upload terrain geometry, replacing any previous buffers.
-    pub fn upload(&mut self, vertex_bytes: &[u8], indices: &[u32]) {
+    /// Replace one section's terrain buffers, keeping other sections as-is.
+    pub fn upload_section(
+        &mut self,
+        section: torse_types::SectionPos,
+        vertex_bytes: &[u8],
+        indices: &[u32],
+    ) {
         use wgpu::util::DeviceExt;
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("client terrain vertices"),
-                contents: vertex_bytes,
-                usage: BufferUsages::VERTEX,
-            });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("client terrain indices"),
-                contents: &by_index_bytes(indices),
-                usage: BufferUsages::INDEX,
-            });
-        self.vertex_buffer = Some(vertex_buffer);
-        self.index_buffer = Some(index_buffer);
-        self.index_count = indices.len() as u32;
+        let buffers = SectionBuffers {
+            vertices: self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("client terrain vertices"),
+                    contents: vertex_bytes,
+                    usage: BufferUsages::VERTEX,
+                }),
+            indices: self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("client terrain indices"),
+                    contents: &by_index_bytes(indices),
+                    usage: BufferUsages::INDEX,
+                }),
+            index_count: indices.len() as u32,
+        };
+        self.terrain.insert(section, buffers);
+    }
+
+    /// Drop the buffers of unloaded sections.
+    pub fn retain_sections(&mut self, keep: &[torse_types::SectionPos]) {
+        self.terrain.retain(|pos, _| keep.contains(pos));
     }
 
     /// Stage the camera matrix for the next frame.
@@ -321,10 +338,10 @@ impl GpuContext {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        if let (Some(vertices), Some(indices)) = (&self.vertex_buffer, &self.index_buffer) {
-            pass.set_vertex_buffer(0, vertices.slice(..));
-            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+        for section in self.terrain.values() {
+            pass.set_vertex_buffer(0, section.vertices.slice(..));
+            pass.set_index_buffer(section.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..section.index_count, 0, 0..1);
         }
         if self.line_count > 0 {
             pass.set_pipeline(&self.line_pipeline);
@@ -397,9 +414,14 @@ impl Renderer {
         })
     }
 
-    /// Upload terrain geometry.
-    pub fn upload(&mut self, vertex_bytes: &[u8], indices: &[u32]) {
-        self.context.upload(vertex_bytes, indices);
+    /// Replace one section's terrain buffers.
+    pub fn upload_section(
+        &mut self,
+        section: torse_types::SectionPos,
+        vertex_bytes: &[u8],
+        indices: &[u32],
+    ) {
+        self.context.upload_section(section, vertex_bytes, indices);
     }
 
     /// Render one frame into the offscreen target.

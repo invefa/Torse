@@ -117,7 +117,7 @@ fn main() -> ExitCode {
                     "adapter={} backend={} format={} frames={} streams={} rebuilds={} \
                      uploads={} screenshots={} actions_ok={} actions_rejected={} walk_ticks={} \
                      walker=({:.1},{:.1},{:.1}) session={} batches={} requests_sent={} requests_rejected={} baseline_sections={} \
-                     sections={} meshes={} vertices={} faces={} elapsed_ms={}",
+                     sections={} meshes={} vertices={} faces={} elapsed_ms={} \n                     mean_frame_us={} max_frame_us={} stream_frame_us={} rebuild_frame_us={}",
                     summary.adapter,
                     summary.backend,
                     summary.format,
@@ -142,6 +142,10 @@ fn main() -> ExitCode {
                     summary.vertices,
                     summary.faces,
                     summary.elapsed_ms,
+                    summary.mean_frame_us,
+                    summary.max_frame_us,
+                    summary.stream_frame_us,
+                    summary.rebuild_frame_us,
                 );
                 ExitCode::SUCCESS
             }
@@ -185,7 +189,7 @@ fn run(
     let vertex_bytes = Scene::vertex_bytes(&vertices);
 
     let mut renderer = Renderer::new(width, height)?;
-    renderer.upload(&vertex_bytes, &indices);
+    renderer.upload_section(torse_types::SectionPos::ZERO, &vertex_bytes, &indices);
 
     let (eye, target) = match view {
         "player" => {

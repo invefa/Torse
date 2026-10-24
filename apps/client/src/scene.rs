@@ -457,6 +457,15 @@ impl Scene {
     /// Network scenes keep the server's subscribed sections; streaming would
     /// fabricate terrain the server does not have.
     pub fn load_around(&mut self, center: SectionPos) -> Result<(), String> {
+        self.stream_around(center, usize::MAX)
+    }
+
+    /// Stream the radius window around `center`, generating at most `budget`
+    /// missing sections this call.
+    ///
+    /// Splitting generation across frames keeps a crossing from stalling the
+    /// frame; callers re-invoke until the window is complete.
+    pub fn stream_around(&mut self, center: SectionPos, budget: usize) -> Result<(), String> {
         if self.generator.is_none() {
             return Ok(());
         }
@@ -478,8 +487,19 @@ impl Scene {
             }
         }
 
+        // Near columns first so the terrain under the camera arrives early.
+        wanted.sort_by_key(|pos| {
+            let dx = pos.x - center.x;
+            let dz = pos.z - center.z;
+            dx * dx + dz * dz
+        });
+        let mut generated = 0usize;
         for pos in &wanted {
             if self.authority.store().phase(*pos).is_none() {
+                if generated >= budget {
+                    break;
+                }
+                generated += 1;
                 let store = self.authority.store_mut();
                 store.request(*pos).map_err(|error| error.to_string())?;
                 let section = self
@@ -514,12 +534,11 @@ impl Scene {
     /// Capturing a fresh job here instead would compare the world with itself
     /// and never notice a neighbour change.
     ///
-    /// Returns how many meshes were rebuilt, so callers can skip a GPU upload
-    /// when nothing changed.
-    pub fn refresh_meshes(&mut self) -> usize {
+    /// Returns the rebuilt sections, so callers re-upload only what changed.
+    pub fn refresh_meshes(&mut self) -> Vec<SectionPos> {
         let store = self.authority.store();
         let registry = self.authority.registry();
-        let mut rebuilt = 0usize;
+        let mut rebuilt = Vec::new();
         for pos in &self.sections {
             let unchanged = self
                 .meshes
@@ -534,9 +553,57 @@ impl Scene {
             };
             let mesh = build_mesh(self.side, *pos, |query| sample(store, registry, query));
             self.meshes.insert(*pos, (job, mesh));
-            rebuilt += 1;
+            rebuilt.push(*pos);
         }
         rebuilt
+    }
+
+    /// Interleaved vertices and indices of the entity boxes, world space.
+    pub fn entity_geometry(&self) -> (Vec<Vertex>, Vec<u32>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (handle, entity) in self.authority.entities().iter() {
+            // The walker is the camera; drawing its body would fill the view.
+            if Some(handle) == self.walker.map(|walker| walker.handle) {
+                continue;
+            }
+            push_entity_box(
+                &mut vertices,
+                &mut indices,
+                [
+                    entity.position.x as f32,
+                    entity.position.y as f32,
+                    entity.position.z as f32,
+                ],
+            );
+        }
+        (vertices, indices)
+    }
+
+    /// Interleaved vertices and indices of one cached section, world space.
+    pub fn section_geometry(&self, pos: SectionPos) -> Option<(Vec<Vertex>, Vec<u32>)> {
+        let (_, mesh) = self.meshes.get(&pos)?;
+        let offset = [
+            pos.x as f32 * self.side as f32,
+            0.0,
+            pos.z as f32 * self.side as f32,
+        ];
+        let mut vertices = Vec::with_capacity(mesh.positions.len());
+        let mut indices = Vec::with_capacity(mesh.indices.len());
+        for (index, position) in mesh.positions.iter().enumerate() {
+            let material = mesh.materials[index / 4];
+            vertices.push(Vertex {
+                position: [
+                    position[0] + offset[0],
+                    position[1] + offset[1],
+                    position[2] + offset[2],
+                ],
+                normal: mesh.normals[index],
+                color: material_color(self.authority.registry(), material),
+            });
+        }
+        indices.extend(mesh.indices.iter().copied());
+        Some((vertices, indices))
     }
 
     /// Face count of one cached mesh, for tests.
@@ -755,10 +822,10 @@ mod tests {
     fn scene_generates_and_meshes_its_radius() {
         let mut scene = Scene::new(1).expect("scene builds");
         assert_eq!(scene.sections().len(), 9);
-        assert_eq!(scene.refresh_meshes(), 9);
+        assert_eq!(scene.refresh_meshes().len(), 9);
         assert_eq!(scene.mesh_count(), 9);
         // Nothing changed, so the second pass rebuilds nothing.
-        assert_eq!(scene.refresh_meshes(), 0);
+        assert_eq!(scene.refresh_meshes().len(), 0);
         let (vertices, indices, faces) = scene.geometry();
         assert!(!vertices.is_empty());
         assert!(!indices.is_empty());
@@ -785,7 +852,10 @@ mod tests {
             .apply_edit(true, &stone, BlockPos::new(16, 15, 1))
             .expect("place Y");
         let rebuilt = scene.refresh_meshes();
-        assert!(rebuilt >= 2, "neighbour and border section must rebuild");
+        assert!(
+            rebuilt.len() >= 2,
+            "neighbour and border section must rebuild"
+        );
 
         let faces_after = scene.mesh_face_count(SectionPos::ZERO).expect("cached");
         assert_eq!(
@@ -805,7 +875,7 @@ mod tests {
         scene.load_around(SectionPos::new(3, 0, 0)).expect("load");
         assert_eq!(scene.sections().len(), 9);
         // The unloaded column's meshes are gone; the new ones are built.
-        assert!(scene.refresh_meshes() > 0);
+        assert!(!scene.refresh_meshes().is_empty());
         assert_eq!(scene.mesh_count(), 9);
         let after = scene.geometry();
         assert!(!after.0.is_empty());
@@ -1038,7 +1108,7 @@ mod tests {
         );
         assert_eq!(stored.expect("entity").position.y, 2.0);
         // Meshes build from the mirrored sections alone.
-        assert_eq!(scene.refresh_meshes(), 2);
+        assert_eq!(scene.refresh_meshes().len(), 2);
         let (vertices, indices, _) = scene.geometry();
         assert!(!vertices.is_empty() && !indices.is_empty());
         // Streaming must not fabricate terrain around the mirror.
@@ -1083,7 +1153,7 @@ mod tests {
         assert!(query(&scene, BlockPos::new(5, 0, 5)));
         // The replaced section rebuilds despite matching revision numbers,
         // and the neighbour rebuilds because it observed the old revision.
-        assert_eq!(scene.refresh_meshes(), 2);
+        assert_eq!(scene.refresh_meshes().len(), 2);
     }
 
     #[test]

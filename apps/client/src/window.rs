@@ -32,6 +32,13 @@ use torse_world::Position;
 
 /// How far the pick ray reaches, in blocks.
 const PICK_RANGE: f32 = 64.0;
+/// Synthetic section key carrying the entity box buffers.
+const ENTITY_SLOT: SectionPos = SectionPos::new(i64::MAX, 0, i64::MAX);
+/// Sections generated per frame while streaming; spreading the work keeps
+/// the frame time bounded at the cost of populating a window over a few
+/// frames.
+const STREAM_BUDGET: usize = 4;
+
 /// Autoplay fires one demonstration action every this many frames.
 const AUTOPLAY_PERIOD: u32 = 24;
 /// Camera eye height above the walker's body centre.
@@ -108,6 +115,14 @@ pub struct WindowSummary {
     pub faces: usize,
     /// Wall time from resume to exit.
     pub elapsed_ms: u128,
+    /// Mean frame interval in microseconds.
+    pub mean_frame_us: u64,
+    /// Longest frame interval in microseconds.
+    pub max_frame_us: u64,
+    /// Mean frame time while streaming new sections.
+    pub stream_frame_us: u64,
+    /// Mean frame time containing mesh rebuilds.
+    pub rebuild_frame_us: u64,
 }
 
 struct Gpu {
@@ -157,6 +172,15 @@ struct WindowApp {
     last_frame: Option<Instant>,
     fps_origin: Instant,
     fps_frames: u32,
+    frame_total_us: u128,
+    frame_max_us: u128,
+    frame_count: u32,
+    streams_mark: usize,
+    stream_total_us: u128,
+    stream_count: u32,
+    rebuilds_mark: usize,
+    rebuild_total_us: u128,
+    rebuild_count: u32,
     pending_shot: Option<String>,
     summary: Option<WindowSummary>,
     failure: Option<String>,
@@ -207,6 +231,15 @@ impl WindowApp {
             last_frame: None,
             fps_origin: Instant::now(),
             fps_frames: 0,
+            frame_total_us: 0,
+            frame_max_us: 0,
+            frame_count: 0,
+            streams_mark: 0,
+            stream_total_us: 0,
+            stream_count: 0,
+            rebuilds_mark: 0,
+            rebuild_total_us: 0,
+            rebuild_count: 0,
             pending_shot: None,
             summary: None,
             failure: None,
@@ -214,7 +247,8 @@ impl WindowApp {
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
+        let frame_started = Instant::now();
+        let now = frame_started;
         // First frame assumes 60 fps; afterwards integrate the real interval,
         // clamped so a pause (breakpoint, window drag) cannot teleport the camera.
         let step = self
@@ -350,26 +384,24 @@ impl WindowApp {
             .as_ref()
             .expect("camera implies scene")
             .center_section(camera.eye);
-        if self.center != Some(center) {
-            self.center = Some(center);
-            // Network scenes keep the subscribed sections; streaming would
-            // fabricate terrain the server does not have.
-            if !self
-                .scene
-                .as_ref()
-                .expect("camera implies scene")
-                .is_network()
-            {
-                let Some(scene) = self.scene.as_mut() else {
-                    return;
-                };
-                if let Err(error) = scene.load_around(center) {
-                    self.failure = Some(format!("streaming failed: {error}"));
-                    event_loop.exit();
-                    return;
-                }
+        // Local scenes stream continuously with a per-frame generation
+        // budget: a crossing no longer stalls one frame with a whole ring of
+        // fresh sections. Network scenes keep the subscribed sections.
+        if self.scene.as_ref().is_some_and(|scene| !scene.is_network()) {
+            let Some(scene) = self.scene.as_mut() else {
+                return;
+            };
+            if let Err(error) = scene.stream_around(center, STREAM_BUDGET) {
+                self.failure = Some(format!("streaming failed: {error}"));
+                event_loop.exit();
+                return;
+            }
+            if self.center != Some(center) {
+                self.center = Some(center);
                 self.streams += 1;
             }
+        } else {
+            self.center = None;
         }
 
         // Resolve the aim from the fresh camera, translate clicks and the
@@ -505,19 +537,29 @@ impl WindowApp {
             .as_mut()
             .expect("camera implies scene")
             .refresh_meshes();
-        self.rebuilds += rebuilt;
-        if rebuilt > 0 || !self.uploaded {
-            let (vertices, indices, _) = self
-                .scene
-                .as_ref()
-                .expect("camera implies scene")
-                .geometry();
-            let bytes = Scene::vertex_bytes(&vertices);
+        self.rebuilds += rebuilt.len();
+        if !rebuilt.is_empty() || !self.uploaded {
+            let scene = self.scene.as_ref().expect("camera implies scene");
             if let Some(gpu) = self.gpu.as_mut() {
-                gpu.context.upload(&bytes, &indices);
+                // Re-upload only the changed sections; untouched terrain keeps
+                // its buffers, so an edit costs one small upload, not the
+                // whole scene.
+                for pos in &rebuilt {
+                    if let Some((vertices, indices)) = scene.section_geometry(*pos) {
+                        let bytes = Scene::vertex_bytes(&vertices);
+                        gpu.context.upload_section(*pos, &bytes, &indices);
+                    }
+                }
+                // Entity bodies change without mesh rebuilds; refresh them
+                // alongside any terrain upload.
+                let (entity_vertices, entity_indices) = scene.entity_geometry();
+                let entity_bytes = Scene::vertex_bytes(&entity_vertices);
+                gpu.context
+                    .upload_section(ENTITY_SLOT, &entity_bytes, &entity_indices);
+                gpu.context.retain_sections(scene.sections());
             }
             self.uploaded = true;
-            self.uploads += 1;
+            self.uploads += rebuilt.len();
         }
 
         if self.input.take_screenshot() {
@@ -597,6 +639,21 @@ impl WindowApp {
             }
         }
         queue.present(frame);
+
+        let frame_us = frame_started.elapsed().as_micros();
+        self.frame_total_us += frame_us;
+        self.frame_max_us = self.frame_max_us.max(frame_us);
+        self.frame_count += 1;
+        if self.streams_mark != self.streams {
+            self.streams_mark = self.streams;
+            self.stream_total_us += frame_us;
+            self.stream_count += 1;
+        }
+        if self.rebuilds_mark != self.rebuilds {
+            self.rebuilds_mark = self.rebuilds;
+            self.rebuild_total_us += frame_us;
+            self.rebuild_count += 1;
+        }
 
         self.frames += 1;
         self.fps_frames += 1;
@@ -771,6 +828,23 @@ impl WindowApp {
                     .started
                     .map(|start| start.elapsed().as_millis())
                     .unwrap_or_default(),
+                mean_frame_us: if self.frame_count == 0 {
+                    0
+                } else {
+                    u64::try_from(self.frame_total_us / u128::from(self.frame_count)).unwrap_or(0)
+                },
+                max_frame_us: u64::try_from(self.frame_max_us).unwrap_or(0),
+                stream_frame_us: if self.stream_count == 0 {
+                    0
+                } else {
+                    u64::try_from(self.stream_total_us / u128::from(self.stream_count)).unwrap_or(0)
+                },
+                rebuild_frame_us: if self.rebuild_count == 0 {
+                    0
+                } else {
+                    u64::try_from(self.rebuild_total_us / u128::from(self.rebuild_count))
+                        .unwrap_or(0)
+                },
             });
         }
         event_loop.exit();
